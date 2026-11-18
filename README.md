@@ -1,2 +1,2 @@
-# comanda4
-VERSIONE 11/2026
+# comanda1
+comande digitali
