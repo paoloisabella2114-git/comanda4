@@ -1,116 +1,195 @@
-// Piatti esauriti della giornata.
-// Lo stato sta in un database Neon SEPARATO (variabile ESAURITI_DATABASE_URL),
-// mai nel DB delle serate (DATABASE_URL), che qui non viene usato.
-//
-// GET  /api/esauriti          -> { esauriti: [id, id, ...] }   (pubblico, usato da pagina2.html)
-// POST /api/esauriti          -> richiede header x-admin-pin = ADMIN_PIN
-//        { action: 'verify' }            controlla solo il PIN
-//        { id: 12, esaurito: true }     segna/riattiva un piatto
-//        { action: 'reset' }            riattiva tutti
-//
-// Variabili d'ambiente su Vercel:
-//   ADMIN_PIN                 PIN della pagina esauriti.html
-//   ESAURITI_DATABASE_URL     indirizzo postgresql://... del database Neon separato
-//
-// La tabella "esauriti" viene creata da sola la prima volta.
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Piatti esauriti - Sagra Smart</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex,nofollow">
+    <script src="/js/jquery.min.js"></script>
+    <link rel="stylesheet" href="css/styles.css">
+    <style>
+        #msg { display:none; background:#e74c3c; color:#fff; padding:12px; border-radius:12px; margin:10px 0; text-align:center; font-weight:bold; }
+        .barra { display:flex; justify-content:space-between; align-items:center; margin:8px 0 12px; font-weight:bold; color:#7f8c8d; }
+        .barra b { color:#c0392b; font-size:20px; }
+        #cerca { margin-bottom:10px; }
+        .solo-esauriti { display:flex; align-items:center; gap:10px; margin-bottom:12px; font-size:16px; font-weight:bold; color:#555; cursor:pointer; }
+        .solo-esauriti input { transform:scale(1.5); }
+        .cat-titolo { background:#34495e; color:#fff; padding:10px 14px; border-radius:10px; margin:16px 0 6px; font-size:16px; font-weight:bold; text-transform:uppercase; }
+        .riga-piatto { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:12px 6px; border-bottom:1px solid #eee; }
+        .riga-piatto .nome { flex:1; font-size:18px; font-weight:600; color:#2c3e50; word-break:break-word; }
+        .riga-piatto.esaurito .nome { color:#c0392b; text-decoration:line-through; }
+        .btn-toggle { width:140px; flex-shrink:0; padding:14px 6px; border:none; border-radius:12px; color:#fff; font-size:15px; font-weight:bold; cursor:pointer; background:#27ae60; box-shadow:0 4px #1e8449; -webkit-tap-highlight-color:transparent; }
+        .btn-toggle.esaurito { background:#c0392b; box-shadow:0 4px #922b21; }
+        .btn-toggle:active { transform:translateY(4px); box-shadow:none; }
+        .btn-grande { display:block; width:100%; padding:16px; margin-top:12px; border:none; border-radius:12px; color:#fff; font-size:17px; font-weight:bold; cursor:pointer; }
+        #vuoto { text-align:center; color:#999; padding:20px; }
+    </style>
+</head>
+<body>
+<div class="main-container">
+    <h1>🚫 PIATTI ESAURITI</h1>
+    <div id="msg"></div>
 
-const crypto = require('crypto');
-const { Pool } = require('pg');
+    <!-- LOGIN -->
+    <div id="box-login" class="card" style="box-shadow:none; border:none; padding:0;">
+        <label for="pin">🔑 PIN</label>
+        <input type="password" id="pin" autocomplete="off" placeholder="PIN">
+        <button type="button" id="btn-entra" class="btn-grande" style="background:#e67e22;">ENTRA</button>
+    </div>
 
-const DB_URL = process.env.ESAURITI_DATABASE_URL;
-let pool = null;
-let tabellaPronta = null;
+    <!-- GESTIONE -->
+    <div id="box-gestione" style="display:none;">
+        <div class="barra"><span>Esauriti adesso</span><b id="conta">0</b></div>
+        <input type="text" id="cerca" placeholder="CERCA PIATTO" autocomplete="off">
+        <label class="solo-esauriti"><input type="checkbox" id="solo"> Mostra solo gli esauriti</label>
+        <div id="lista"><div class="loader">Caricamento menù...</div></div>
+        <button type="button" id="btn-reset" class="btn-grande" style="background:#2980b9;">♻️ RIATTIVA TUTTI</button>
+        <button type="button" id="btn-esci" class="btn-grande" style="background:#95a5a6;">🚪 ESCI</button>
+    </div>
+</div>
 
-// La "giornata di servizio" cambia alle 05:00 (Europe/Rome), non a mezzanotte:
-// se la serata finisce dopo le 24 i piatti esauriti non si riattivano da soli.
-function giornoServizio(giorniIndietro = 0) {
-  const d = new Date(Date.now() - (5 + 24 * giorniIndietro) * 3600 * 1000);
-  return d.toLocaleDateString('sv-SE', { timeZone: 'Europe/Rome' }); // AAAA-MM-GG
+<script>
+let pin = sessionStorage.getItem('esauriti_pin') || '';
+let menu = [];
+let esauriti = new Set();
+let inCorso = 0;     // operazioni di salvataggio in corso (il refresh automatico aspetta)
+let timerRefresh = null;
+
+function messaggio(testo) {
+    if (!testo) { $('#msg').hide(); return; }
+    $('#msg').text(testo).show();
 }
 
-function db() {
-  if (!DB_URL) throw new Error('ESAURITI_DATABASE_URL non impostata');
-  if (!pool) {
-    pool = new Pool({
-      connectionString: DB_URL,
-      ssl: { rejectUnauthorized: false },
-      max: 1,
-      connectionTimeoutMillis: 4000,   // se Neon è lento il cliente non resta in attesa
-      query_timeout: 4000,
-      idleTimeoutMillis: 10000
+function chiama(body) {
+    return $.ajax({
+        url: '/api/esauriti', method: 'POST', dataType: 'json',
+        contentType: 'application/json', headers: { 'x-admin-pin': pin },
+        data: JSON.stringify(body)
     });
-    pool.on('error', e => console.error('pool esauriti:', e.message));
-  }
-  if (!tabellaPronta) {
-    tabellaPronta = pool.query(
-      'CREATE TABLE IF NOT EXISTS esauriti (' +
-      'giorno date NOT NULL, id_articolo integer NOT NULL, PRIMARY KEY (giorno, id_articolo))'
-    ).catch(e => { tabellaPronta = null; throw e; });
-  }
-  return tabellaPronta.then(() => pool);
 }
 
-async function elenco(p, giorno) {
-  const r = await p.query('SELECT id_articolo FROM esauriti WHERE giorno = $1::date', [giorno]);
-  return r.rows.map(x => Number(x.id_articolo));
+function erroreDi(xhr) {
+    if (xhr.status === 401) return 'PIN errato';
+    return (xhr.responseJSON && xhr.responseJSON.error) || 'Connessione assente, riprova';
 }
 
-function pinCorretto(ricevuto) {
-  const atteso = process.env.ADMIN_PIN;
-  const h = s => crypto.createHash('sha256').update(String(s)).digest();
-  return crypto.timingSafeEqual(h(ricevuto || ''), h(atteso));
+function esci() {
+    sessionStorage.removeItem('esauriti_pin');
+    pin = '';
+    clearInterval(timerRefresh);
+    $('#box-gestione').hide();
+    $('#box-login').show();
+    $('#pin').val('').focus();
 }
 
-function leggiBody(req) {
-  let b = req.body;
-  if (typeof b === 'string') { try { b = JSON.parse(b); } catch (e) { b = {}; } }
-  return b || {};
+function entra() {
+    pin = $('#pin').val().trim();
+    if (!pin) { messaggio('Inserisci il PIN'); return; }
+    messaggio('');
+    chiama({ action: 'verify' }).done(function () {
+        sessionStorage.setItem('esauriti_pin', pin);
+        avvia();
+    }).fail(function (xhr) { messaggio(erroreDi(xhr)); });
 }
 
-module.exports = async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  const giorno = giornoServizio();
+function avvia() {
+    $('#box-login').hide();
+    $('#box-gestione').show();
+    messaggio('');
+    $.when(
+        $.ajax({ url: '/api/menu', dataType: 'json', cache: false }),
+        $.ajax({ url: '/api/esauriti', dataType: 'json', cache: false })
+    ).done(function (m, e) {
+        menu = m[0];
+        esauriti = new Set(e[0].esauriti);
+        render();
+    }).fail(function () {
+        $('#lista').html('<div id="vuoto">Errore caricamento menù. Ricarica la pagina.</div>');
+    });
+    clearInterval(timerRefresh);
+    timerRefresh = setInterval(aggiornaStato, 15000);   // allinea più dispositivi
+}
 
-  if (req.method === 'GET') {
-    // Lato cliente: se il database non risponde il menu deve funzionare comunque.
-    try {
-      const p = await db();
-      return res.json({ esauriti: await elenco(p, giorno) });
-    } catch (err) {
-      console.error('esauriti GET:', err.message);
-      return res.json({ esauriti: [] });
+function aggiornaStato() {
+    if (inCorso > 0 || document.hidden) return;
+    $.ajax({ url: '/api/esauriti', dataType: 'json', cache: false }).done(function (e) {
+        if (inCorso > 0) return;
+        esauriti = new Set(e.esauriti);
+        render();
+    });
+}
+
+function render() {
+    const filtro = $('#cerca').val().trim().toLowerCase();
+    const soloEsauriti = $('#solo').is(':checked');
+    const $lista = $('#lista').empty();
+    let cat = null, mostrati = 0;
+
+    menu.forEach(function (p) {
+        const id = Number(p.id);
+        const isEsaurito = esauriti.has(id);
+        if (soloEsauriti && !isEsaurito) return;
+        if (filtro && String(p.nome).toLowerCase().indexOf(filtro) === -1) return;
+
+        if (p.nome_tipologia !== cat) {
+            cat = p.nome_tipologia;
+            $('<div class="cat-titolo">').text(cat).appendTo($lista);
+        }
+        const $riga = $('<div class="riga-piatto">').toggleClass('esaurito', isEsaurito);
+        $('<span class="nome">').text(p.nome).appendTo($riga);
+        $('<button type="button" class="btn-toggle">')
+            .toggleClass('esaurito', isEsaurito)
+            .text(isEsaurito ? '🚫 ESAURITO' : '✅ DISPONIBILE')
+            .on('click', function () { toggle(id); })
+            .appendTo($riga);
+        $riga.appendTo($lista);
+        mostrati++;
+    });
+
+    if (mostrati === 0) $lista.html('<div id="vuoto">Nessun piatto</div>');
+    $('#conta').text(esauriti.size);
+}
+
+function toggle(id) {
+    const nuovo = !esauriti.has(id);
+    const prima = new Set(esauriti);
+    if (nuovo) esauriti.add(id); else esauriti.delete(id);   // aggiornamento immediato
+    render();
+    messaggio('');
+    inCorso++;
+    chiama({ id: id, esaurito: nuovo }).done(function (r) {
+        esauriti = new Set(r.esauriti);
+    }).fail(function (xhr) {
+        esauriti = prima;                                    // annulla se non salvato
+        messaggio('NON SALVATO: ' + erroreDi(xhr));
+        if (xhr.status === 401) esci();
+    }).always(function () { inCorso--; render(); });
+}
+
+function riattivaTutti() {
+    if (esauriti.size === 0) return;
+    if (!confirm('Riattivare tutti i piatti?')) return;
+    inCorso++;
+    chiama({ action: 'reset' }).done(function (r) {
+        esauriti = new Set(r.esauriti);
+    }).fail(function (xhr) {
+        messaggio('NON SALVATO: ' + erroreDi(xhr));
+    }).always(function () { inCorso--; render(); });
+}
+
+$(function () {
+    $('#btn-entra').on('click', entra);
+    $('#pin').on('keydown', function (e) { if (e.key === 'Enter') entra(); });
+    $('#cerca').on('input', render);
+    $('#solo').on('change', render);
+    $('#btn-reset').on('click', riattivaTutti);
+    $('#btn-esci').on('click', esci);
+
+    if (pin) {
+        // PIN già salvato in questa sessione: verifica e riparte
+        chiama({ action: 'verify' }).done(avvia).fail(function () { esci(); });
     }
-  }
-
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Metodo non consentito' });
-
-  if (!process.env.ADMIN_PIN) return res.status(500).json({ error: 'ADMIN_PIN non impostato su Vercel' });
-  if (!pinCorretto(req.headers['x-admin-pin'])) return res.status(401).json({ error: 'PIN errato' });
-
-  const b = leggiBody(req);
-  try {
-    if (b.action === 'verify') return res.json({ ok: true });
-
-    const p = await db();
-    if (b.action === 'reset') {
-      await p.query('DELETE FROM esauriti WHERE giorno = $1::date', [giorno]);
-    } else {
-      const id = parseInt(b.id, 10);
-      if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'id non valido' });
-      if (b.esaurito) {
-        await p.query(
-          'INSERT INTO esauriti (giorno, id_articolo) VALUES ($1::date, $2) ON CONFLICT DO NOTHING',
-          [giorno, id]
-        );
-        // pulizia dei giorni vecchi (più di una settimana fa)
-        await p.query('DELETE FROM esauriti WHERE giorno < $1::date', [giornoServizio(7)]);
-      } else {
-        await p.query('DELETE FROM esauriti WHERE giorno = $1::date AND id_articolo = $2', [giorno, id]);
-      }
-    }
-    return res.json({ esauriti: await elenco(p, giorno) });
-  } catch (err) {
-    console.error('esauriti POST:', err.message);
-    return res.status(500).json({ error: 'Errore salvataggio (database esauriti)' });
-  }
-};
+});
+</script>
+</body>
+</html>
