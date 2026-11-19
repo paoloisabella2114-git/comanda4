@@ -1,5 +1,6 @@
 // Piatti esauriti della giornata.
-// Lo stato NON sta nel DB delle serate ma in Upstash Redis (REST), per non toccare il DB universale.
+// Lo stato sta in un database Neon SEPARATO (variabile ESAURITI_DATABASE_URL),
+// mai nel DB delle serate (DATABASE_URL), che qui non viene usato.
 //
 // GET  /api/esauriti          -> { esauriti: [id, id, ...] }   (pubblico, usato da pagina2.html)
 // POST /api/esauriti          -> richiede header x-admin-pin = ADMIN_PIN
@@ -8,34 +9,50 @@
 //        { action: 'reset' }            riattiva tutti
 //
 // Variabili d'ambiente su Vercel:
-//   ADMIN_PIN                                    PIN della pagina esauriti.html
-//   KV_REST_API_URL + KV_REST_API_TOKEN          (oppure UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN)
+//   ADMIN_PIN                 PIN della pagina esauriti.html
+//   ESAURITI_DATABASE_URL     indirizzo postgresql://... del database Neon separato
+//
+// La tabella "esauriti" viene creata da sola la prima volta.
 
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
-const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-const SCADENZA_SEC = 48 * 3600; // pulizia automatica della chiave
+const DB_URL = process.env.ESAURITI_DATABASE_URL;
+let pool = null;
+let tabellaPronta = null;
 
 // La "giornata di servizio" cambia alle 05:00 (Europe/Rome), non a mezzanotte:
 // se la serata finisce dopo le 24 i piatti esauriti non si riattivano da soli.
-function chiaveOggi() {
-  const d = new Date(Date.now() - 5 * 3600 * 1000);
-  return 'esauriti:' + d.toLocaleDateString('sv-SE', { timeZone: 'Europe/Rome' });
+function giornoServizio(giorniIndietro = 0) {
+  const d = new Date(Date.now() - (5 + 24 * giorniIndietro) * 3600 * 1000);
+  return d.toLocaleDateString('sv-SE', { timeZone: 'Europe/Rome' }); // AAAA-MM-GG
 }
 
-async function redis(comandi) {
-  if (!REDIS_URL || !REDIS_TOKEN) throw new Error('Redis non configurato');
-  const r = await fetch(REDIS_URL + '/pipeline', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + REDIS_TOKEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify(comandi)
-  });
-  if (!r.ok) throw new Error('Redis HTTP ' + r.status);
-  const risposte = await r.json();
-  const errore = risposte.find(x => x && x.error);
-  if (errore) throw new Error('Redis: ' + errore.error);
-  return risposte;
+function db() {
+  if (!DB_URL) throw new Error('ESAURITI_DATABASE_URL non impostata');
+  if (!pool) {
+    pool = new Pool({
+      connectionString: DB_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 1,
+      connectionTimeoutMillis: 4000,   // se Neon è lento il cliente non resta in attesa
+      query_timeout: 4000,
+      idleTimeoutMillis: 10000
+    });
+    pool.on('error', e => console.error('pool esauriti:', e.message));
+  }
+  if (!tabellaPronta) {
+    tabellaPronta = pool.query(
+      'CREATE TABLE IF NOT EXISTS esauriti (' +
+      'giorno date NOT NULL, id_articolo integer NOT NULL, PRIMARY KEY (giorno, id_articolo))'
+    ).catch(e => { tabellaPronta = null; throw e; });
+  }
+  return tabellaPronta.then(() => pool);
+}
+
+async function elenco(p, giorno) {
+  const r = await p.query('SELECT id_articolo FROM esauriti WHERE giorno = $1::date', [giorno]);
+  return r.rows.map(x => Number(x.id_articolo));
 }
 
 function pinCorretto(ricevuto) {
@@ -52,13 +69,13 @@ function leggiBody(req) {
 
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  const key = chiaveOggi();
+  const giorno = giornoServizio();
 
   if (req.method === 'GET') {
-    // Lato cliente: se Redis non risponde il menu deve funzionare comunque.
+    // Lato cliente: se il database non risponde il menu deve funzionare comunque.
     try {
-      const [m] = await redis([['SMEMBERS', key]]);
-      return res.json({ esauriti: (m.result || []).map(Number) });
+      const p = await db();
+      return res.json({ esauriti: await elenco(p, giorno) });
     } catch (err) {
       console.error('esauriti GET:', err.message);
       return res.json({ esauriti: [] });
@@ -74,22 +91,26 @@ module.exports = async (req, res) => {
   try {
     if (b.action === 'verify') return res.json({ ok: true });
 
-    let comandi;
+    const p = await db();
     if (b.action === 'reset') {
-      comandi = [['DEL', key]];
+      await p.query('DELETE FROM esauriti WHERE giorno = $1::date', [giorno]);
     } else {
       const id = parseInt(b.id, 10);
       if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'id non valido' });
-      comandi = b.esaurito
-        ? [['SADD', key, String(id)], ['EXPIRE', key, SCADENZA_SEC]]
-        : [['SREM', key, String(id)]];
+      if (b.esaurito) {
+        await p.query(
+          'INSERT INTO esauriti (giorno, id_articolo) VALUES ($1::date, $2) ON CONFLICT DO NOTHING',
+          [giorno, id]
+        );
+        // pulizia dei giorni vecchi (più di una settimana fa)
+        await p.query('DELETE FROM esauriti WHERE giorno < $1::date', [giornoServizio(7)]);
+      } else {
+        await p.query('DELETE FROM esauriti WHERE giorno = $1::date AND id_articolo = $2', [giorno, id]);
+      }
     }
-    comandi.push(['SMEMBERS', key]);
-    const risposte = await redis(comandi);
-    const ultimo = risposte[risposte.length - 1];
-    return res.json({ esauriti: (ultimo.result || []).map(Number) });
+    return res.json({ esauriti: await elenco(p, giorno) });
   } catch (err) {
     console.error('esauriti POST:', err.message);
-    return res.status(500).json({ error: 'Errore salvataggio (Redis)' });
+    return res.status(500).json({ error: 'Errore salvataggio (database esauriti)' });
   }
 };
